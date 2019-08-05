@@ -1,0 +1,97 @@
+#
+# source: https://gist.github.com/aamedina/6786deaa496cd8b3ef43
+#
+I hope the following helps you follow some of the code I've released
+thus far in lieu of documentation. :)
+
+1) Use JNAerator to generate JNA bindings for libLLVM and libclang.
+
+LLVM bindings:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/java/clojure/asm/LLVMLibrary.java
+clang bindings:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/java/clojure/asm/ClangLibrary.java
+
+2) Using a macro, generate inline-able Clojure functions and constants
+that correspond to the body of those generated Java classes using
+reflection.
+
+generate-wrapper-api macro:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/clojure/clojure/asm/api.clj
+LLVM Clojure bindings:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/clojure/clojure/asm/llvm.clj
+clang Clojure bindings:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/clojure/clojure/asm/clang.clj
+
+3) Very minimal additional code is required for those classes, but I
+extended print-method implementations for the most important types so
+that you can get visual feedback on the various native objects you use
+and change in the REPL. I also added some dynamic vars to enable
+thread-local state, like the current module, context, execution engine
+(if you're JIT compiling LLVM IR into native code for your CPU),
+etc. The goal is to keep the API as close to the C headers as possible
+in order to be able to use most of, if not all, of the same code after
+the metacircular evaluator is working. (Since those names will
+correspond correctly to the names in the C headers which can be
+resolved statically using the "reflection" library I will give an
+overview of next.)
+
+4) The reflector itself works as follows: libclang is written in C++,
+and as you know, the Visitor pattern is popular in the non-functional,
+especially Java and C++ world. Since we're using the C API, we don't
+have classes per se, so the visitor pattern is implemented in terms of
+a function pointer that is invoked on every node the visitor
+encounters during its traversal. Depending on the return code of the
+visitor, it will either recursively traverse into nested children, or
+simply iterate through every top level AST node it encounters in the
+cursor it is visiting.
+
+I exposed two functions: visit-children and visit-fields, the latter
+of which should probably be renamed visit-recursively, because the
+only difference between the two is that the latter recursively
+traverses the AST node.
+
+The visitor function pointer is exposed to Java through JNA's Callback
+interface. Hence, I reify an implementation of the Visitor's callback
+function ( (apply [this cursor parent client-data]) ...) and delegate
+the functionality to a multimethod (-cursor-visitor), which dispatches
+according to the type of the AST node it is currently looking at.
+
+At the moment the most important AST nodes I collect reflection
+information about are Structs, Typedefs, Functions, Global variables,
+and Struct fields. This can be easily extended in the future thanks to
+the extensibility of multimethods.
+
+The visitor object itself is put in a plain old java.util.HashMap to
+create a strong reference to the reified Callback, preventing its
+collection by the Java GC. Since libclang does not provide a way
+beyond a manual invocation of "free" to release the memory of any
+Visitor to the C API, it is not safe to allow the object to EVER be
+collected by the JVM. To do so would invite indeterministic fatal
+exceptions which will crash the JVM, even long after the Visitor has
+finished its traversal. I learned this the hard way. In short, the
+"solution" is to purposefully create a memory leak by never removing
+the visitors from the java.util.HashMap after its
+initialization. It's a shortcoming, but ultimately managable for now.
+
+Reflector code:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/clojure/clojure/asm/reflector.clj
+
+5) The last bit of information you need in order to understand how the
+Reflector works is the function clang->llvm.
+
+Because the code generator for the compiler works by interacting with
+and creating LLVM values which can emit LLVM IR, the reflector ensures
+all Clang identified C language types are appropriately mapped to
+their equivalent LLVM types. This requires an exhaustive walk of the
+type aliases C allows. Thankfully, libclang (in combination with
+Clojure!) makes this a cinch.  The type mapper is implemented as a
+function that delegates to a multimethod if the type has not already
+been generated at least once before and cached.
+
+All unresolvable types (types for which are valid, but a matching
+multimethod implementation cannot be found) simply resolve an i8* - or
+in LLVM jargon, a pointer to bytes. This serves as a more type safe
+version of the infamous void pointer in C.
+
+type mapper:
+https://github.com/aamedina/clojure.asm.clang/blob/master/src/main/clojure/clojure/asm/type_mapper.clj
